@@ -1,6 +1,7 @@
 import sys
 import json
 import functools
+import contextvars
 from inspect import iscoroutine
 from traceback import format_exc
 import itertools
@@ -24,6 +25,63 @@ from . import error_render
 __version__ = "2.5"
 
 HTTP_METHODS = 'DELETE GET HEAD OPTIONS PATCH POST PUT'.split()
+
+
+# The ombott app currently handling a request in this (thread / async-task)
+# context. It's what makes the module-level ``request``/``response`` (and
+# ``redirect()``) resolve to the right instance when several apps run in one
+# process -- e.g. a single async server multiplexing several isolated apps
+# concurrently. ``None`` outside a request => fall back to the default app.
+_current_app = contextvars.ContextVar('ombott_current_app', default=None)
+
+
+class _CurrentProxy:
+    """A stand-in for ``request``/``response`` that always forwards to the app
+    currently serving in this context (or the default app outside a request).
+
+    There is exactly one proxy per attribute, so any code that snapshots
+    ``ombott.request`` / ``ombott.response`` at import time (websaw's ``globs``
+    and ``BaseContext``, ``redirect()``, ...) keeps a stable reference that still
+    tracks the live per-request object -- correct even under concurrency.
+    """
+    __slots__ = ('_attr',)
+
+    def __init__(self, attr):
+        object.__setattr__(self, '_attr', attr)
+
+    def _t(self):
+        app = _current_app.get()
+        return getattr(app if app is not None else Globals.app, self._attr)
+
+    def __getattr__(self, name):
+        return getattr(self._t(), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._t(), name, value)
+
+    def __delattr__(self, name):
+        delattr(self._t(), name)
+
+    def __getitem__(self, k):
+        return self._t()[k]
+
+    def __setitem__(self, k, v):
+        self._t()[k] = v
+
+    def __delitem__(self, k):
+        del self._t()[k]
+
+    def __contains__(self, k):
+        return k in self._t()
+
+    def __iter__(self):
+        return iter(self._t())
+
+    def __len__(self):
+        return len(self._t())
+
+    def __repr__(self):
+        return repr(self._t())
 
 
 @SimpleConfig.keys_holder
@@ -283,6 +341,7 @@ class Ombott:
         except UnicodeError:
             return HTTPError(400, 'Invalid path string. Expected UTF-8')
         environ['PATH_INFO'] = path
+        token = _current_app.set(self)
         try:  # init thread
             environ['ombott.app'] = self
             request.__init__(environ)
@@ -308,6 +367,8 @@ class Ombott:
             stacktrace = format_exc()
             environ['wsgi.errors'].write(stacktrace)
             return HTTPError(500, "Internal Server Error", err500, stacktrace)
+        finally:
+            _current_app.reset(token)
 
     def _cast(self, out):
         """ Try to convert the parameter into something WSGI compatible and set
@@ -450,6 +511,7 @@ class Ombott:
         except UnicodeError:
             return HTTPError(400, 'Invalid path string. Expected UTF-8')
         environ['PATH_INFO'] = path
+        token = _current_app.set(self)
         try:
             environ['ombott.app'] = self
             request.__init__(environ)
@@ -494,6 +556,8 @@ class Ombott:
             stacktrace = format_exc()
             environ['wsgi.errors'].write(stacktrace)
             return HTTPError(500, "Internal Server Error", err500, stacktrace)
+        finally:
+            _current_app.reset(token)
 
     async def asgi(self, scope, receive, send):
         stype = scope['type']
@@ -678,8 +742,10 @@ class Globals:
     app = Ombott()
     route = app.route
     on_route = app.on_route
-    request = app.request
-    response = app.response
+    # Context-local: resolve to whichever app is serving this request (see
+    # _current_app / _CurrentProxy), so several apps can share one process.
+    request = _CurrentProxy('request')
+    response = _CurrentProxy('response')
     error = app.error
 
 
